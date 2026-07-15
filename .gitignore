@@ -1,0 +1,30 @@
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache and temporary files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Exclude any folder starting with '20' followed by two digits (2000-2099)
+20[0-9][0-9]/
+# Fallback / future-proofing for any folder matching 20XX pattern
+20??/
+
+# Generated templates and training folders
+PLANTILLAS/
+PLANTILLAS_ENTRENAMIENTO/
+PLANTILLAS_REFERENCE/
+
+# Archive files
+*.zip
+*.rar
+*.tar.gz
+
+# System files
+.DS_Store
+Thumbs.db
