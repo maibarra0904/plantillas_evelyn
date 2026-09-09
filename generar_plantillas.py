@@ -2,6 +2,7 @@ import os
 import xlrd
 import xlwt
 from datetime import datetime
+from collections import Counter
 
 # Input source files directory and target output directories
 SOURCE_DIR = "."
@@ -16,6 +17,85 @@ style_header = xlwt.easyxf('font: bold on; align: horiz left')
 style_general = xlwt.easyxf('align: horiz left')
 style_date = xlwt.easyxf('align: horiz left', num_format_str='dd/mm/yyyy')
 style_number = xlwt.easyxf('align: horiz left', num_format_str='#,##0.00')
+
+MONTH_NAMES = {
+    1: "Enero", 2: "Febrero", 3: "Marzo", 4: "Abril",
+    5: "Mayo", 6: "Junio", 7: "Julio", 8: "Agosto",
+    9: "Septiembre", 10: "Octubre", 11: "Noviembre", 12: "Diciembre"
+}
+
+# Module-level dynamically detected reference month
+EXPECTED_MONTH = None
+
+def detect_reference_month(source_dir=SOURCE_DIR):
+    """
+    Intelligently detects the reference month by inspecting bank files known
+    for having consistent and reliable dates:
+    - banco_central.xls (which uses Excel serial numeric dates)
+    - banco_jep.xls (which uses unambiguous DD/MM/YYYY text dates)
+    Falls back to scanning other banks or directory path if not found.
+    """
+    votes_central = Counter()
+    votes_jep = Counter()
+
+    # 1. Inspect banco_central.xls
+    central_file = os.path.join(source_dir, "banco_central.xls")
+    if os.path.exists(central_file):
+        try:
+            wb = xlrd.open_workbook(central_file)
+            s = wb.sheet_by_index(0)
+            for r in range(s.nrows):
+                v = s.cell_value(r, 0)
+                if isinstance(v, (int, float)) and v > 40000:
+                    try:
+                        dt = xlrd.xldate_as_tuple(v, wb.datemode)
+                        if dt[0] >= 2020 and 1 <= dt[1] <= 12:
+                            votes_central[dt[1]] += 1
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f"[-] Error extracting date from banco_central: {e}")
+
+    # 2. Inspect banco_jep.xls
+    jep_file = os.path.join(source_dir, "banco_jep.xls")
+    if os.path.exists(jep_file):
+        try:
+            wb = xlrd.open_workbook(jep_file)
+            s = wb.sheet_by_index(0)
+            for r in range(s.nrows):
+                v = str(s.cell_value(r, 0)).strip()
+                if "/" in v:
+                    parts = v.split("/")
+                    if len(parts) == 3:
+                        try:
+                            m = int(parts[1])
+                            if 1 <= m <= 12:
+                                votes_jep[m] += 1
+                        except ValueError:
+                            pass
+        except Exception as e:
+            print(f"[-] Error extracting date from banco_jep: {e}")
+
+    combined = votes_central + votes_jep
+    if combined:
+        ref_month = combined.most_common(1)[0][0]
+        c_count = votes_central.get(ref_month, 0)
+        j_count = votes_jep.get(ref_month, 0)
+        month_name = MONTH_NAMES.get(ref_month, str(ref_month))
+        print(f"[+] Reference month detected from reliable templates: {ref_month:02d} ({month_name})")
+        print(f"    Confidence: banco_central ({c_count} rows), banco_jep ({j_count} rows)")
+        return ref_month
+
+    # Fallback to directory name
+    cwd = os.getcwd().lower()
+    script_dir = os.path.dirname(os.path.abspath(__file__)).lower()
+    for m_num, m_name in MONTH_NAMES.items():
+        if m_name.lower() in cwd or m_name.lower() in script_dir:
+            print(f"[!] Falling back to directory name for month: {m_num:02d} ({m_name})")
+            return m_num
+
+    print("[!] Warning: Could not detect month from central/jep or path. Defaulting to current month.")
+    return datetime.now().month
 
 def clean_amount(val):
     if isinstance(val, (int, float)):
@@ -35,20 +115,18 @@ def clean_amount(val):
     except:
         return 0.0
 
-def parse_date(val, datemode, bank_name):
-    # Determine expected month based on directory path (5 for Mayo, 6 for June/default)
-    expected_month = 6
-    cwd = os.getcwd().lower()
-    script_dir = os.path.dirname(os.path.abspath(__file__)).lower()
-    if "mayo" in cwd or "may" in cwd or "mayo" in script_dir or "may" in script_dir:
-        expected_month = 5
+def parse_date(val, datemode, bank_name, expected_month=None):
+    if expected_month is None:
+        expected_month = EXPECTED_MONTH
+    if expected_month is None:
+        expected_month = detect_reference_month(SOURCE_DIR)
 
     if isinstance(val, (int, float)):
         try:
             dt_tuple = xlrd.xldate_as_tuple(val, datemode)
             dt = datetime(dt_tuple[0], dt_tuple[1], dt_tuple[2])
-            # Check if we need to swap day and month
-            if dt.month != expected_month:
+            # Check if day and month were inverted in Excel numeric date
+            if expected_month is not None and dt.month != expected_month:
                 if dt.day <= 12:
                     swapped = datetime(dt.year, dt.day, dt.month)
                     if swapped.month == expected_month:
@@ -62,19 +140,20 @@ def parse_date(val, datemode, bank_name):
         return None
         
     # Remove time part if present
-    val_str = val_str.split(' ')[0]
+    val_str = val_str.split(' ')[0].split('T')[0]
     
-    # Try parsing formats. Prefer the one that matches expected_month
+    # Try parsing formats. Prioritize format matching the expected reference month
     parsed_dt = None
-    formats = ['%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d', '%d-%m-%Y']
-    for fmt in formats:
-        try:
-            dt = datetime.strptime(val_str, fmt)
-            if dt.month == expected_month:
-                parsed_dt = dt
-                break
-        except ValueError:
-            continue
+    formats = ['%d/%m/%Y', '%m/%d/%Y', '%Y-%m-%d', '%d-%m-%Y', '%Y/%m/%d']
+    if expected_month is not None:
+        for fmt in formats:
+            try:
+                dt = datetime.strptime(val_str, fmt)
+                if dt.month == expected_month:
+                    parsed_dt = dt
+                    break
+            except ValueError:
+                continue
             
     if parsed_dt is None:
         # Fallback to first format that parses
@@ -89,7 +168,7 @@ def parse_date(val, datemode, bank_name):
         return None
         
     # If month doesn't match expected_month and day is <= 12, swap them
-    if parsed_dt.month != expected_month:
+    if expected_month is not None and parsed_dt.month != expected_month:
         try:
             if parsed_dt.day <= 12:
                 swapped = datetime(parsed_dt.year, parsed_dt.day, parsed_dt.month)
@@ -134,6 +213,38 @@ def write_template(output_filename, rows):
         ws.write(r, 4, val, style_number)
         ws.write(r, 5, mov_type, style_general)
         ws.write(r, 6, desc, style_general)
+        
+    # Auto-adjust column widths based on content
+    # Bold headers take slightly more width than normal text (~1.15x)
+    col_max_lens = [int(len(h) * 1.15) + 3 for h in headers]
+    min_widths = [20, 15, 15, 15, 14, 15, 20]
+    
+    for row in rows:
+        acc_num, doc_class, seq_num, date_obj, val, mov_type, desc = row
+        val_str = f"{val:,.2f}" if isinstance(val, (int, float)) else (str(val) if val is not None else "")
+        date_str_len = 10 if isinstance(date_obj, datetime) else len(str(date_obj) if date_obj is not None else "")
+        desc_str = str(desc) if desc is not None else ""
+        desc_max_line = max([len(line) for line in desc_str.splitlines()] or [0])
+        
+        cell_lens = [
+            len(str(acc_num) if acc_num is not None else ""),
+            len(str(doc_class) if doc_class is not None else ""),
+            len(str(seq_num) if seq_num is not None else ""),
+            date_str_len,
+            len(val_str),
+            len(str(mov_type) if mov_type is not None else ""),
+            desc_max_line
+        ]
+        
+        for c, l in enumerate(cell_lens):
+            adjusted_len = l + 4
+            if adjusted_len > col_max_lens[c]:
+                col_max_lens[c] = adjusted_len
+                
+    for c, max_len in enumerate(col_max_lens):
+        char_width = max(max_len, min_widths[c])
+        # In xlwt, width is in 1/256 of character width. Excel max column width is 255 chars (65280)
+        ws.col(c).width = min(65280, int(char_width * 256))
         
     wb.save(output_filename)
 
@@ -671,13 +782,18 @@ def process_transferunion(src_sheet, datemode):
     return rows
 
 def main():
+    global EXPECTED_MONTH
     banks = [
         "bolivariano", "central", "guayaquil", "huancavilca", "jep",
         "machala", "pacifico", "pichincha", "produbanco", "reporne",
         "sagrario", "transferunion"
     ]
     
-    print("=== Generating templates into PLANTILLAS_ENTRENAMIENTO ===")
+    # 1. Intelligently detect reference month from reliable templates (banco_central & banco_jep)
+    EXPECTED_MONTH = detect_reference_month(SOURCE_DIR)
+    month_name = MONTH_NAMES.get(EXPECTED_MONTH, str(EXPECTED_MONTH))
+    
+    print(f"\n=== Generating templates into {OUTPUT_DIR} (Target Month: {EXPECTED_MONTH:02d} - {month_name}) ===")
     for bank in banks:
         source_file = os.path.join(SOURCE_DIR, f"banco_{bank}.xls")
         output_file = os.path.join(OUTPUT_DIR, f"plantilla_banco_{bank}.xls")
@@ -704,64 +820,87 @@ def main():
             import traceback
             traceback.print_exc()
 
-    # Run verification against PLANTILLAS
-    print("\n=== Verifying generated templates against PLANTILLAS ===")
-    mismatches = 0
-    matches = 0
-    for bank in banks:
-        ref_file = os.path.join(TEMPLATE_REF_DIR, f"plantilla_banco_{bank}.xls")
-        gen_file = os.path.join(OUTPUT_DIR, f"plantilla_banco_{bank}.xls")
-        
-        if not os.path.exists(ref_file):
-            print(f"[-] Reference file not found: {ref_file}")
-            continue
-        if not os.path.exists(gen_file):
-            print(f"[-] Generated file not found: {gen_file}")
-            continue
-            
-        try:
-            ref_wb = xlrd.open_workbook(ref_file)
-            ref_sheet = ref_wb.sheet_by_index(0)
-            
-            gen_wb = xlrd.open_workbook(gen_file)
-            gen_sheet = gen_wb.sheet_by_index(0)
-            
-            if ref_sheet.nrows != gen_sheet.nrows:
-                print(f"[-] {bank}: Row count mismatch. Ref={ref_sheet.nrows}, Gen={gen_sheet.nrows}")
-                mismatches += 1
+    # 2. Verify date consistency against the reference month in all generated templates
+    if EXPECTED_MONTH is not None:
+        print(f"\n=== Verifying date consistency against reference month {EXPECTED_MONTH:02d} ({month_name}) ===")
+        all_consistent = True
+        total_rows_checked = 0
+        for bank in banks:
+            gen_file = os.path.join(OUTPUT_DIR, f"plantilla_banco_{bank}.xls")
+            if not os.path.exists(gen_file):
                 continue
+            try:
+                gen_wb = xlrd.open_workbook(gen_file)
+                gen_sheet = gen_wb.sheet_by_index(0)
+                mismatches = []
+                data_rows = gen_sheet.nrows - 1
+                total_rows_checked += data_rows
                 
-            if ref_sheet.ncols != gen_sheet.ncols:
-                print(f"[-] {bank}: Col count mismatch. Ref={ref_sheet.ncols}, Gen={gen_sheet.ncols}")
-                mismatches += 1
-                continue
-                
-            bank_matched = True
-            for r in range(ref_sheet.nrows):
-                for c in range(ref_sheet.ncols):
-                    ref_val = ref_sheet.cell_value(r, c)
-                    gen_val = gen_sheet.cell_value(r, c)
-                    
-                    if isinstance(ref_val, float) and isinstance(gen_val, float):
-                        if abs(ref_val - gen_val) > 1e-6:
-                            print(f"  [-] Mismatch in {bank} @ Row {r}, Col {c}. Ref={repr(ref_val)}, Gen={repr(gen_val)}")
-                            bank_matched = False
+                for r in range(1, gen_sheet.nrows):
+                    cell_val = gen_sheet.cell_value(r, 3) # Col 3: FECHA DE DOCUMENTO
+                    if gen_sheet.cell_type(r, 3) == xlrd.XL_CELL_DATE:
+                        dt = xlrd.xldate_as_tuple(cell_val, gen_wb.datemode)
+                        if dt[1] != EXPECTED_MONTH:
+                            mismatches.append((r, f"{dt[2]:02d}/{dt[1]:02d}/{dt[0]}"))
                     else:
-                        if str(ref_val).strip() != str(gen_val).strip():
-                            print(f"  [-] Mismatch in {bank} @ Row {r}, Col {c}. Ref={repr(ref_val)}, Gen={repr(gen_val)}")
-                            bank_matched = False
-                            
-            if bank_matched:
-                print(f"[SUCCESS] {bank}: Matches reference exactly!")
-                matches += 1
-            else:
+                        mismatches.append((r, str(cell_val)))
+                        
+                if mismatches:
+                    all_consistent = False
+                    print(f"[-] {bank:15}: {len(mismatches)}/{data_rows} rows have unexpected dates! Samples: {mismatches[:3]}")
+                else:
+                    print(f"[OK] {bank:15}: {data_rows:4d}/{data_rows:4d} rows verified in {month_name}")
+            except Exception as e:
+                print(f"[-] Error verifying dates for {bank}: {e}")
+                all_consistent = False
+                
+        if all_consistent:
+            print(f"\n[SUCCESS] 100% of dates ({total_rows_checked} rows) in all bank templates verified in month {EXPECTED_MONTH:02d} ({month_name})!")
+        else:
+            print(f"\n[WARNING] Some dates did not match reference month {EXPECTED_MONTH:02d}.")
+
+    # 3. Run verification against reference files if available
+    if os.path.exists(TEMPLATE_REF_DIR) and os.listdir(TEMPLATE_REF_DIR):
+        print("\n=== Verifying generated templates against reference folder ===")
+        mismatches = 0
+        matches = 0
+        for bank in banks:
+            ref_file = os.path.join(TEMPLATE_REF_DIR, f"plantilla_banco_{bank}.xls")
+            gen_file = os.path.join(OUTPUT_DIR, f"plantilla_banco_{bank}.xls")
+            
+            if not os.path.exists(ref_file) or not os.path.exists(gen_file):
+                continue
+                
+            try:
+                ref_wb = xlrd.open_workbook(ref_file)
+                ref_sheet = ref_wb.sheet_by_index(0)
+                gen_wb = xlrd.open_workbook(gen_file)
+                gen_sheet = gen_wb.sheet_by_index(0)
+                
+                if ref_sheet.nrows != gen_sheet.nrows or ref_sheet.ncols != gen_sheet.ncols:
+                    mismatches += 1
+                    continue
+                    
+                bank_matched = True
+                for r in range(ref_sheet.nrows):
+                    for c in range(ref_sheet.ncols):
+                        ref_val = ref_sheet.cell_value(r, c)
+                        gen_val = gen_sheet.cell_value(r, c)
+                        if isinstance(ref_val, float) and isinstance(gen_val, float):
+                            if abs(ref_val - gen_val) > 1e-6:
+                                bank_matched = False
+                        else:
+                            if str(ref_val).strip() != str(gen_val).strip():
+                                bank_matched = False
+                                
+                if bank_matched:
+                    matches += 1
+                else:
+                    mismatches += 1
+            except Exception as e:
                 mismatches += 1
                 
-        except Exception as e:
-            print(f"[-] Error verifying {bank}: {e}")
-            mismatches += 1
-            
-    print(f"\nVerification summary: {matches} matched, {mismatches} mismatched.")
+        print(f"Reference verification summary: {matches} matched, {mismatches} mismatched.")
 
 if __name__ == "__main__":
     main()
